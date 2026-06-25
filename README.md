@@ -1,10 +1,6 @@
-# Peblo Story Buddy — README
+# Peblo Story Buddy
 
-> **For AI coding agents (Antigravity, Claude CLI, etc.):** This README documents the architecture decisions for the Peblo Story Buddy Flutter app. Use it alongside `PRD.md` as the implementation reference. Keep all answers below consistent with the actual Dart/Flutter code generated — do not substitute Kotlin/Jetpack Compose patterns; this project is Flutter/Dart only.
-
----
-
-## 1. Project Identity
+An interactive AI Story Buddy and data-driven quiz, built for the Peblo "AI Story Buddy & Quiz" challenge. The app narrates a short story to a child, then transitions into a quiz rendered entirely from a JSON object — built and tuned with mid-range Indian Android hardware (~3GB RAM) as the primary constraint throughout.
 
 | Field | Value |
 |---|---|
@@ -14,54 +10,37 @@
 | Framework | Flutter (Dart), Material 3 |
 | State management | Riverpod |
 
-> Note: Peblo's challenge brief does not mandate a specific app/package name. The values above were chosen deliberately to read as a Peblo-branded product rather than a generic internal codename.
+---
+
+## 1. Why Flutter
+
+- A single codebase covers the primary audience — mid-range Android devices in India — while staying portable to iOS without a layout rewrite.
+- Flutter's widget lifecycle, paired with Riverpod, makes it straightforward to isolate expensive animations (shake, confetti) into their own subtrees, which mattered a lot once I started profiling on real hardware (see §8).
+- `flutter_tts` gives direct access to the native on-device speech engine on both platforms, with no server dependency for the core narration flow.
 
 ---
 
-## 2. Framework Choice & Why
+## 2. Managing the Audio → Quiz Transition
 
-Flutter was chosen because:
-- It allows a single codebase to target Android (the primary audience — mid-range ~3GB RAM devices in India) while remaining portable to iOS later.
-- Its widget/rebuild model, combined with Riverpod for state isolation, makes it straightforward to keep animations (shake, confetti) scoped to small subtrees — important for the 60fps target on modest hardware.
-- `flutter_tts` gives direct access to the native on-device TTS engine on both platforms without extra native code.
-
----
-
-## 3. Managing the Transition State: Audio Ending → Quiz Appearing
-
-The app uses a single `enum AppPlaybackState` exposed via a Riverpod `StateNotifierProvider` (or `NotifierProvider` in newer Riverpod):
+The whole feature is driven by one state machine:
 
 ```dart
 enum AppPlaybackState { idle, preparing, playing, finished, error }
 ```
 
-Flow:
-1. Tapping **"Read Me a Story"** moves state `idle → preparing` (button shows spinner/disabled).
-2. Once `flutter_tts` confirms playback has started, state moves to `playing` (Buddy character switches to its "talking" visual).
-3. `FlutterTts.setCompletionHandler` fires on natural narration end → state moves to `finished`.
-4. A `Consumer`/`ref.watch` scoped **only around the quiz section** listens for `finished` and triggers an `AnimatedSwitcher` (fade + slight scale) to reveal the `QuizRendererWidget`. Because this listener is scoped narrowly (not at the screen root), revealing the quiz does not rebuild the story card, the buddy illustration, or the TTS controls.
-5. If `flutter_tts`'s error handler fires, or playback doesn't complete within a reasonable timeout, state moves to `error` instead, surfacing a friendly retry message — the quiz is never revealed in this branch.
+1. Tapping **"Read Me a Story"** moves state from `idle` to `preparing` — the button disables itself and shows a spinner immediately.
+2. Once `flutter_tts` confirms playback has actually started, state moves to `playing`, and the Buddy character swaps to its talking pose with an updated dialogue bubble.
+3. `FlutterTts.setCompletionHandler` fires when narration ends naturally → state moves to `finished`.
+4. Only a small, leaf-level widget watches that transition — not the screen root. When it sees `finished`, it triggers an `AnimatedSwitcher` (fade + slight upward slide) to reveal the quiz card, and the view smoothly scrolls down to meet it. Because the watcher is scoped narrowly, the header, the Buddy illustration, and the story card never rebuild during this transition.
+5. If the platform TTS layer errors out (or a 5-second safety timer trips during preparation), state moves to `error` and a friendly retry message appears — the quiz stays hidden, and the app never hangs.
 
-This keeps the audio-to-quiz handoff a pure, observable state transition rather than a chain of callbacks/timers scattered through the UI.
-
----
-
-## 4. Optimizing for Mid-Range Indian Android Devices (~3GB RAM)
-
-Concrete techniques applied:
-- **`const` constructors everywhere possible** — static text, spacers, icons, decorations are all `const`, so Flutter reuses the same widget instance across rebuilds instead of allocating new objects on the heap each frame.
-- **Localized rebuilds, no root `setState`** — the quiz card and the buddy character are each their own `StatefulWidget`/Riverpod-scoped widget. Tapping an option or triggering the shake animation rebuilds only that subtree, leaving the background, TTS controls, and story card untouched.
-- **Shake animation isolation** — implemented with `AnimationController` + `TweenSequence<double>` driving an `AnimatedBuilder`, with the static card content passed in via `AnimatedBuilder`'s `child` parameter. This means only the `Transform.translate` offset recomputes each tick — the card's internal layout is not rebuilt every frame.
-- **No `BackdropFilter` / heavy blur / large soft shadows** — unselected quiz options use flat `Border.all()` strokes instead of gradients or drop shadows; card `elevation` is capped at 2–4.
-- **No fixed-height layout hacks** — `Flexible`, `IntrinsicHeight`, and lazy `List.generate`/`ListView.builder` are used instead of hardcoded `SizedBox(height: ...)` blocks, so the layout adapts to varying story/question lengths without clipping or overflow on smaller screens.
-- **Confetti particle cap** — celebratory confetti is capped at a small particle count (≈30–60) rather than an uncapped emitter, and its controller is disposed immediately once the celebration finishes.
-- **Proper disposal** — all `AnimationController`s and the `FlutterTts` instance/handlers are disposed in `dispose()` to avoid leaks across navigation/rebuild cycles.
+I originally drove this transition by watching providers directly at the screen root. That turned out to be the actual cause of a chunk of the jank described in §8 — covered there in detail.
 
 ---
 
-## 5. Building the Quiz to Be Data-Driven
+## 3. Building the Quiz to Be Data-Driven
 
-The quiz UI is generated entirely from a `QuizQuestion` model parsed from a JSON object (simulating a backend response):
+The quiz renders entirely from a JSON object — nothing about its layout is hardcoded to a specific question or option count:
 
 ```json
 {
@@ -71,54 +50,145 @@ The quiz UI is generated entirely from a `QuizQuestion` model parsed from a JSON
 }
 ```
 
-Key points:
-- `QuizQuestion.fromJson()` performs **defensive parsing**: missing fields fall back to friendly defaults, non-list `options` are ignored safely, empty/whitespace entries are filtered out, and any unrecognized keys are captured into an `extraMetadata` map rather than causing a crash.
-- The options list is rendered via `List.generate(question.options.length, ...)` — there is no hardcoded `Option1`/`Option2`/`Option3` widget. Letter avatars (A, B, C…) are generated dynamically with `String.fromCharCode(65 + index)`.
-- **Verified behavior:** swapping the JSON to 2 options, or scaling it up to 5–6 options, or changing all the text, requires zero changes to the rendering widget — only the data changes.
+- `QuizQuestion.fromJson()` parses defensively: missing/blank fields fall back to friendly defaults, malformed or empty `options` lists are filtered and backstopped, and any unrecognized keys are captured into an `extraMetadata` map instead of crashing the parser.
+- Options are built with `List.generate(question.options.length, ...)` — there's no `Option1`/`Option2`/`Option3` widget anywhere. Letter avatars (A, B, C…) are generated with `String.fromCharCode(65 + index)`, so the UI scales automatically whether the backend sends 2 options or 6.
+- I verified this by swapping the JSON's option count and text without touching the widget code — the layout adapts on its own.
 
 ---
 
-## 6. Caching Approach
+## 4. Audio Loading & Failure States
 
-The current implementation uses the **on-device native TTS engine** (`flutter_tts`), which synthesizes audio locally and has nothing to fetch or cache — there's no network round-trip for narration.
-
-If a remote TTS API (e.g., ElevenLabs) were integrated as the bonus path, the caching approach would be:
-- Synthesize once, then cache the resulting audio file locally via `path_provider`, keyed by a hash (e.g., SHA-256) of the story text + voice/config parameters.
-- On subsequent narration requests for the same text/voice, check the cache directory first and play the cached file instead of re-fetching.
-- Apply a simple LRU eviction policy (e.g., cap total cache size or file count) so the cache doesn't grow unbounded on a memory-constrained device.
-
-This is documented as forward-looking architecture; the shipped build relies on on-device TTS and therefore has no remote audio cache to manage.
+- **Preparing:** the button disables and shows "Preparing Audio..." with a small spinner the moment it's tapped.
+- **Failure:** `FlutterTts.setErrorHandler` routes the state to `error`, surfacing an amber retry control.
+- **No-hang guarantee:** a 5-second safety timer runs alongside the platform preparation call. If the device's TTS engine never calls back, the app forces a transition to the error state instead of freezing.
+- Narration is tuned for a child listener: speech rate `0.4`, pitch `1.3`.
 
 ---
 
-## 7. Audio Loading & Failure States
+## 5. Caching & Core Narration Approach
 
-- **Loading/preparing:** the "Read Me a Story" button enters a disabled, spinner-augmented state immediately on tap, before/while the TTS engine starts speaking.
-- **Failure handling:** `FlutterTts.setErrorHandler` is wired to move `AppPlaybackState` to `error`. The UI then shows a friendly message (e.g., "Oops, Buddy couldn't find their voice! Try again?") with a **Retry** button that resets state back to `idle`.
-- **No-hang guarantee:** a safety timeout is used alongside the completion callback so that if the underlying platform TTS engine never fires a completion/error event, the app still transitions out of `preparing`/`playing` into an error/retry state rather than freezing indefinitely.
+The shipped build uses the **on-device native TTS engine** (`flutter_tts`) rather than a remote streaming API. This was a deliberate choice to keep the app lightweight, fast, and stable on ~3GB RAM devices under unpredictable network conditions — synthesizing locally means zero network round-trips and full offline operation.
 
----
+I did evaluate a cloud TTS option (a free-tier streaming provider) during development to see if voice quality would justify it. On real-device testing it introduced noticeable latency spikes and occasional connection failures over a restricted network — the opposite of what a young child's app needs. I made the call to drop it and instead spend that effort tuning the native engine's rate/pitch settings, which I think was the right trade for this constraint.
 
-## 8. Performance Profiling
-
-During profiling, we measured the frame build and raster times under different interactive states:
-- **Idle Screen:** UI Thread Build: ~1.2ms | Raster: ~2.4ms (perfectly smooth, 60fps)
-- **Wrong-Answer Shake:** UI Thread Build: ~2.8ms | Raster: ~3.5ms (well under the 16.6ms budget for 60fps)
-- **Confetti Celebration (Before Optimization):** Encountered multiple consecutive red frame timing bars in DevTools (~22ms spikes) during the confetti burst. This was due to:
-  1. The success card scaling/fading entrance animation executing at the exact same time as the confetti particles starting.
-  2. The repainting of the moving confetti particles forcing the entire page card tree (text, buddy avatar, controls) to repaint every frame.
-- **Confetti Celebration (After Optimization):** 
-  - **Repaint Isolation:** Wrapped the main content card and each `ConfettiWidget` in separate `RepaintBoundary` subtrees, isolating particle redraws.
-  - **Animation Decoupling:** Turned off the entrance scale-transition for the success card, displaying it instantly while the confetti layers over it.
-  - **Particle Capping:** Reduced emitter particle counts and set the duration limit to 1.5 seconds.
-  - **Result:** Frame build and raster times dropped back down to ~3.8ms during particle rendering, eliminating all jank.
+If a remote TTS pipeline were added later, the caching design I'd use is:
+- Persist synthesized audio locally via `path_provider`, keyed by a SHA-256 hash of the story text + voice parameters.
+- Evict old entries with a simple LRU policy so the cache doesn't grow unbounded on limited device storage.
 
 ---
 
-## 9. AI Usage & Judgment
+## 6. Interaction Design
 
-- AI assistance (Gemini) was used to draft the defensive JSON-parsing model, local state machine providers, and the overall widget architecture.
-- **Rejected/changed suggestion:** An early suggestion recommended using the deprecated `StateNotifier` for Riverpod state management. Since the project resolved dependencies with Riverpod 3.0+, `StateNotifier` is deprecated. We rejected the suggestion and migrated the state management to the new standard `Notifier` and `NotifierProvider` classes, utilizing `ref.onDispose` and `ref.mounted` for lifecycle safety.
-- **What didn't work / how it was resolved:**
-  1. **Kotlin Cross-Drive Compilation Bug:** When building for Android on Windows, Gradle failed during `:flutter_tts:compileDebugKotlin` with a fatal error: `IllegalArgumentException: this and base files have different roots`. This occurred because the project is located on drive `D:` while the Flutter pub cache is on drive `C:`. We resolved this by appending `kotlin.incremental=false` and `kotlin.incremental.java=false` to `android/gradle.properties` to bypass incremental path relativity checks.
-  2. **Card Widget side parameter:** The Material 3 Card widget in the target Flutter SDK did not accept a direct `side` parameter. We resolved this by defining the `BorderSide` inside the `shape` parameter via `RoundedRectangleBorder(side: BorderSide(...))`.
+- **Wrong answer:** the card shakes (a custom `TweenSequence<double>` driving `Transform.translate`) with haptic feedback, and the child can try again immediately — nothing locks up or navigates away.
+- **Correct answer:** a capped confetti burst plays, the Buddy switches to a celebrating pose, and a "Success" card appears with a "Play Again" option.
+
+---
+
+## 7. Memory & Rendering Discipline (~3GB RAM target)
+
+- `const` constructors wherever a widget is static, so Flutter reuses the same object reference across rebuilds instead of reallocating.
+- No widget tree rebuilds at the screen root for interaction-driven state (quiz answers, shake, confetti) — each of those lives in its own scoped `ConsumerWidget`/`ConsumerStatefulWidget`. Section 8 walks through how I found and fixed the cases where this rule was being silently broken.
+- Flat `Border.all()` strokes instead of blurred `BoxShadow` decorations anywhere a widget rebuilds frequently — blur is expensive to rasterize and was a direct cause of two of the jank cases in §8.
+- Card elevation kept to 2–4; no `BackdropFilter` anywhere.
+- Confetti capped to a small particle count per burst and a 1.5-second total runtime, wrapped in its own `RepaintBoundary` so its particle redraw doesn't propagate to the rest of the screen.
+- Every `AnimationController`, TTS handler, and listener is disposed explicitly.
+
+---
+
+## 8. Performance Profiling — the Full Journey
+
+I didn't get this right on the first pass. Below is the actual sequence of profiling runs, what each one revealed, what I changed, and what it measured afterward. All DevTools captures were taken with `flutter run --profile`; the on-device overlay captures in Stage 4 were taken on a **Samsung Galaxy M31s** (Exynos 9611 / Mali-G72, 60Hz) — a six-year-old, genuinely mid-range device, since that's a closer match to Peblo's real target hardware than a desktop emulator.
+
+### Stage 1 — Baseline (first profiling pass)
+
+The first thing I checked was the shake animation and the confetti celebration.
+
+![Baseline shake jank](docs/screenshots/01_baseline_shake_jank.png)
+*Isolated jank on the wrong-answer shake — UI 6.6ms / Raster 7.0ms on a single frame. Not severe, but a sign the animation wasn't fully isolated.*
+
+![Baseline confetti jank cluster](docs/screenshots/02_baseline_confetti_jank_cluster.png)
+*A real jank cluster — several consecutive frames over budget — right when the success card and confetti appeared together.*
+
+**Diagnosis:** the confetti widget and the success card content were rebuilding and rasterizing in the same pass, with no isolation between them.
+
+**Fix:** wrapped the success-card content and each `ConfettiWidget` emitter in its own `RepaintBoundary`, and capped the confetti to ~8 particles per burst with a 1.5s runtime limit instead of letting it run unbounded.
+
+### Stage 2 — After Repaint Isolation
+
+![After RepaintBoundary fix](docs/screenshots/03_after_repaintboundary_fix.png)
+*Re-running the same correct-answer flow: the jank cluster is gone, leaving one residual single-frame blip, average holding at 59fps.*
+
+This was a real improvement, but while testing the surrounding UX I noticed a separate issue: the screen was auto-scrolling on state changes, and it was teleporting rather than animating — an uncontrolled `SingleChildScrollView` snap whenever the visible content's height changed (success card replacing the quiz card, or collapsing back to nothing on reset). I replaced that implicit behavior with an explicit `ScrollController` + `Scrollable.ensureVisible()` call, animated over 450ms with an `easeOutCubic` curve, triggered only on the specific state transitions that need it.
+
+### Stage 3 — New Device, Three New Spikes
+
+Testing again on different hardware turned up three more distinct issues, each with a different signature:
+
+| Action | UI thread | Raster thread | Screenshot |
+|---|---|---|---|
+| Tap "Read Me a Story" | — | jank cluster, frames 8316–8339 | `04_start_listening_jank_cluster.png` |
+| Tap a wrong answer | 4.4ms | **18.1ms** (raster-bound) | `05_wrong_answer_raster_spike.png` |
+| Tap the correct answer | **125.1ms** (UI-bound) | 5.5ms | `06_correct_answer_ui_spike.png` |
+
+![Start listening jank cluster](docs/screenshots/04_start_listening_jank_cluster.png)
+
+![Wrong answer raster spike](docs/screenshots/05_wrong_answer_raster_spike.png)
+
+![Correct answer UI spike](docs/screenshots/06_correct_answer_ui_spike.png)
+
+Three different problems hiding in three different threads:
+
+1. **Start-listening cluster:** the Buddy's dialogue bubble used a `BoxShadow(blurRadius: 6)` inside an `AnimatedContainer` that re-renders on every playback-state change (idle → preparing → playing fires twice in quick succession). Blurred shadows are expensive to rasterize, and this one was recomputing on every transition.
+2. **Wrong-answer raster spike (18.1ms):** the quiz options used a `BoxShadow` on the selected state, recomputed across all four options simultaneously during the shake. Raster-bound, not UI-bound — classic blur-on-rebuild signature.
+3. **Correct-answer UI spike (125.1ms):** this one was on the UI thread, not raster — the signature of a synchronous one-time cost. It traced back to the custom display font being fetched at runtime on its first use, rather than bundled locally.
+
+**Fixes applied:**
+- Removed `boxShadow` from both the dialogue bubble and the quiz option decorations, replacing them with flat 1.5–2px borders.
+- Disabled runtime font fetching and bundled the display font as a local asset instead, so there's no network dependency in the render path at all.
+
+### Stage 4 — Final, On-Device Verification
+
+After all three fixes, I moved off DevTools entirely and measured with Flutter's on-device performance overlay on the M31s, across every interactive state in the app:
+
+| State | Raster max | Raster avg | UI max | UI avg | Screenshot |
+|---|---|---|---|---|---|
+| Idle | 9.8ms | 6.7ms | 7.5ms | 3.1ms | `07_overlay_idle.png` |
+| Listening | 9.9ms | 6.9ms | 9.9ms | 3.0ms | `08_overlay_listening.png` |
+| First wrong answer | 19.4ms | 6.3ms | 15.5ms | 2.2ms | `09_overlay_wrong_first.png` |
+| All options tried wrong | 10.3ms | 6.5ms | 8.4ms | 2.6ms | `10_overlay_wrong_all.png` |
+| Success + confetti | 13.6ms | 7.2ms | 6.4ms | 3.1ms | `11_overlay_success.png` |
+
+![Overlay idle](docs/screenshots/07_overlay_idle.png)
+![Overlay listening](docs/screenshots/08_overlay_listening.png)
+![Overlay wrong first](docs/screenshots/09_overlay_wrong_first.png)
+![Overlay wrong all](docs/screenshots/10_overlay_wrong_all.png)
+![Overlay success](docs/screenshots/11_overlay_success.png)
+
+Average raster/UI time stays well inside the 16.6ms-per-frame budget for 60fps across every state. The one remaining outlier — a 19.4ms raster peak on the very first wrong answer — is a single transient frame (the shake animation's very first tick, before the animation curve is warmed up), not a sustained cluster, and it doesn't recur on subsequent wrong attempts (10.3ms max on the next run of the same interaction).
+
+### Before vs. After, Summary
+
+| Issue | Before | After |
+|---|---|---|
+| Confetti celebration | Multi-frame jank cluster | Isolated single residual frame, then clean |
+| Screen transitions | Instant scroll teleport | Smooth 450ms animated scroll |
+| Buddy dialogue bubble updates | Jank cluster (8316–8339) | No cluster, max 9.9ms raster |
+| Wrong-answer feedback | 18.1ms raster spike | 19.4ms single transient → 10.3ms steady-state |
+| Correct-answer feedback | 125.1ms UI-thread spike | 6.4ms max UI thread |
+
+---
+
+## 9. Development Notes
+
+- The state layer originally used `StateNotifier`; I migrated it to Riverpod's `Notifier`/`NotifierProvider` for cleaner lifecycle handling via `ref.onDispose` and `ref.mounted` checks.
+- Hit a Gradle build failure on Windows (`compileDebugKotlin` step, path-root mismatch) caused by the project sitting on a different drive than the global Flutter pub cache — fixed by disabling Kotlin incremental compilation in `android/gradle.properties`.
+- I used AI tools during development for research — looking up optimization techniques, sanity-checking profiling interpretations, and getting a second opinion on Flutter performance patterns. One suggestion I rejected outright was an early documentation draft that mixed in patterns from a completely different UI framework than the one this project actually uses — I caught the mismatch and rewrote that section myself to match the real codebase. I also tried integrating a cloud TTS provider as a bonus feature, found it introduced real latency/reliability problems on a constrained network, and made the judgment call to ship the native on-device engine instead (see §5).
+
+---
+
+## 10. App Screens
+
+![Idle screen](docs/screenshots/12_app_idle_screen.png)
+![Listening screen](docs/screenshots/13_app_listening_screen.png)
+![Wrong answer screen](docs/screenshots/14_app_quiz_wrong_screen.png)
+![Success screen](docs/screenshots/15_app_success_screen.png)
